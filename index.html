@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=0.95, user-scalable=no">
+    <title>Circuit Cubes Dual Drive Remote</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&family=League+Spartan:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script src="interface.js"></script>
+    <script src="ble_nus.js"></script>
+    <script src="ble_lwp.js"></script>
+    <script>
+        var pressTime = 0;
+        var lastDirection = 0;
+        var touchScreen = false;
+
+        async function run_motor(direction, motor) {
+            const speed = getValue(motor + "_speed");
+            const channel = getChannel(motor + "_channel");
+            const invert = getInversion(motor + "_invert");
+            await sendMotorCmd(speed * direction * invert, channel);
+        }
+
+        async function run_drive(direction) {
+            // Send both drive commands in a deterministic order.
+            // Each command targets one output channel of the Circuit Cubes hub.
+            await run_motor(direction, "drive1");
+
+            if (document.getElementById("drive2_enabled").checked) {
+                await run_motor(direction, "drive2");
+            }
+        }
+
+        async function stop_drive() {
+            await run_drive(0);
+        }
+
+        async function steer(direction, touch=true) {
+            if (alreadyTouched(touch)) return;
+
+            if (direction == 0) {
+                const centering = document.getElementById("centering").checked;
+                const elapsed = performance.now() - pressTime;
+                terminal_writeln("steer pressed for " + parseInt(elapsed) + "ms");
+
+                if (centering && lastDirection) {
+                    const interval = getValue("interval");
+                    run_motor(-lastDirection, "steer");
+                    await delay(Math.min(interval, elapsed));
+                    run_motor(0, "steer");
+                    lastDirection = 0;
+                    terminal_writeln("returned to center for " +
+                        parseInt(performance.now() - pressTime - elapsed) + "ms");
+                } else {
+                    run_motor(0, "steer");
+                }
+            } else {
+                lastDirection = direction;
+                run_motor(direction, "steer");
+                pressTime = performance.now();
+            }
+        }
+
+        function drive(direction, touch=true) {
+            if (alreadyTouched(touch)) return;
+            run_drive(direction);
+        }
+
+        async function sendMotorCmd(speed, channel) {
+            let cmd = (speed >= 0) ? "+" : "";
+            cmd += String(Math.abs(speed)).padStart(3, '0') + channel;
+
+            while (bleBusy == true) {
+                await delay(1);
+            }
+
+            nusSendString(cmd, true);
+
+            // A short guard time prevents two independent BLE writes from
+            // being issued at exactly the same time.
+            await delay(8);
+        }
+
+        function getValue(id) {
+            return parseInt(document.getElementById(id).value);
+        }
+
+        function getChannel(name) {
+            return document.querySelector(
+                'input[name="' + name + '"]:checked'
+            ).value;
+        }
+
+        function getInversion(id) {
+            return document.getElementById(id).checked ? -1 : 1;
+        }
+
+        handlers["onleftpluspress"] = () => steer(1);
+        handlers["onleftminuspress"] = () => steer(-1);
+        handlers["onleftrelease"] = () => steer(0);
+        handlers["onrightpluspress"] = () => drive(1);
+        handlers["onrightminuspress"] = () => drive(-1);
+        handlers["onrightrelease"] = () => drive(0);
+    </script>
+</head>
+
+<body onload="onLoad()">
+    <div class="app">
+        <div class="title-container">
+            <span id="cc">CIRCUIT</span><span id="cb">CUBES</span><span id="wr">DUAL DRIVE</span>
+        </div>
+
+        <div class="controls">
+            <div class="control-btns">
+                <div>
+                    <button id="left"
+                        ontouchstart="steer(1)" ontouchend="steer(0)"
+                        onmousedown="steer(1, false)" onmouseup="steer(0, false)">&uarr;</button>
+                </div>
+                <div>
+                    <button id="right"
+                        ontouchstart="steer(-1)" ontouchend="steer(0)"
+                        onmousedown="steer(-1, false)" onmouseup="steer(0, false)">&darr;</button>
+                </div>
+            </div>
+
+            <div class="control-btns" style="flex-direction: column;">
+                <div>
+                    <button id="accelerate"
+                        ontouchstart="drive(1)" ontouchend="drive(0)"
+                        onmousedown="drive(1, false)" onmouseup="drive(0, false)">&uarr;</button>
+                </div>
+                <div>
+                    <button id="reverse"
+                        ontouchstart="drive(-1)" ontouchend="drive(0)"
+                        onmousedown="drive(-1, false)" onmouseup="drive(0, false)">&darr;</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="actions">
+            <div><button id="clientConnectButton" onclick="connectionToggle()">Connect</button></div>
+            <div><button id="remoteConnectButton" onclick="remoteConnectionToggle()">Connect</button></div>
+            <div><button id="settingsButton" onclick="toggleSettings()">Settings</button></div>
+        </div>
+
+        <div id="settings">
+            Settings are saved in cookies when changed.
+
+            <br><br>
+            Drive motor 1:
+            <div class="group">
+                <div class="set">
+                    Speed: <input type="text" id="drive1_speed" value="255" disabled>
+                    <button onclick="inc('drive1_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('drive1_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <label for="drive1_invert">
+                        <input id="drive1_invert" type="checkbox"> Reverse
+                    </label>
+                </div>
+                <div class="set">
+                    Channel:
+                    <label><input type="radio" name="drive1_channel" value="a" checked>A</label>
+                    <label><input type="radio" name="drive1_channel" value="b">B</label>
+                    <label><input type="radio" name="drive1_channel" value="c">C</label>
+                </div>
+            </div>
+
+            Drive motor 2:
+            <div class="group">
+                <div class="set">
+                    <label for="drive2_enabled">
+                        <input id="drive2_enabled" type="checkbox" checked> Enabled
+                    </label>
+                </div>
+                <div class="set">
+                    Speed: <input type="text" id="drive2_speed" value="255" disabled>
+                    <button onclick="inc('drive2_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('drive2_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <label for="drive2_invert">
+                        <input id="drive2_invert" type="checkbox"> Reverse
+                    </label>
+                </div>
+                <div class="set">
+                    Channel:
+                    <label><input type="radio" name="drive2_channel" value="a">A</label>
+                    <label><input type="radio" name="drive2_channel" value="b" checked>B</label>
+                    <label><input type="radio" name="drive2_channel" value="c">C</label>
+                </div>
+            </div>
+
+            Steering:
+            <div class="group">
+                <div class="set">
+                    Speed: <input type="text" id="steer_speed" value="125" disabled>
+                    <button onclick="inc('steer_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('steer_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <label for="steer_invert">
+                        <input id="steer_invert" type="checkbox"> Reverse
+                    </label>
+                </div>
+                <div class="set">
+                    Channel:
+                    <label><input type="radio" name="steer_channel" value="a">A</label>
+                    <label><input type="radio" name="steer_channel" value="b" checked>B</label>
+                    <label><input type="radio" name="steer_channel" value="c">C</label>
+                </div>
+            </div>
+
+            Return to center steering:
+            <div class="group">
+                <div class="set">
+                    <label for="centering">
+                        <input id="centering" type="checkbox" checked> Enabled
+                    </label>
+                </div>
+                <div class="set">
+                    Return time:
+                    <input type="text" id="interval" value="90" disabled> ms
+                    <button onclick="inc('interval')" class="speed-btn">+</button>
+                    <button onclick="dec('interval')" class="speed-btn">-</button>
+                </div>
+                <button class="set console-btn" onclick="toggleTerminal()">Console</button>
+            </div>
+
+            <textarea id="terminal" rows="10" cols="50" readonly></textarea>
+        </div>
+
+        <div class="about">
+            v1.0.0-dual-drive |
+            <a href="https://github.com/repkovsky/CircuitCubesRemote">Original project</a>
+        </div>
+    </div>
+
+    <video loop id="sleep_lock" style="width:1px;">
+        <!-- The original project uses a tiny video to help prevent the browser
+             from suspending the page while Bluetooth communication is active. -->
+        <source type="video/mp4" src="data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAvFtZGF0">
+    </video>
+</body>
+</html>

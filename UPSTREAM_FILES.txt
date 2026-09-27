@@ -1,0 +1,10 @@
+The project started from:
+https://github.com/repkovsky/CircuitCubesRemote
+
+LICENSE must retain the original MIT copyright notice.
+
+ble_lwp.js is functionally the upstream LEGO remote implementation.
+ble_nus.js is based on the upstream implementation but has been made
+Promise-based and uses a dedicated bleNusBusy flag so Dual Drive commands
+are written sequentially and do not conflict with the LEGO remote's
+bleBusy flag.
