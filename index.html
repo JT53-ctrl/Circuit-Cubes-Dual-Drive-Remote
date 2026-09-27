@@ -64,19 +64,25 @@
         }
 
         async function applyDifferential(driveDirection, steerDirection, elapsed) {
-            const base = getValue("drive_speed");
-            const factor = Math.min(1, Math.max(0, elapsed / STEERING_MAX_MS));
+    const base = getValue("drive_speed");
 
-            if (steerDirection < 0) {
-                // Left turn: A is inside and slows down.
-                await setDrive(driveDirection * base * (1 - factor),
-                               driveDirection * base);
-            } else {
-                // Right turn: B is inside and slows down.
-                await setDrive(driveDirection * base,
-                               driveDirection * base * (1 - factor));
-            }
-        }
+    const DIFFERENTIAL_MIN = 0.30; // innerer Motor bleibt bei mindestens 30 %
+
+    const factor = Math.min(1, Math.max(0, elapsed / STEERING_MAX_MS));
+
+    // 1.0 → 0.30 während des maximalen Lenkeinschlags
+    const innerFactor = 1 - factor * (1 - DIFFERENTIAL_MIN);
+
+    if (steerDirection < 0) {
+        // Left turn: A is inside and slows down.
+        await setDrive(driveDirection * base * innerFactor,
+                       driveDirection * base);
+    } else {
+        // Right turn: B is inside and slows down.
+        await setDrive(driveDirection * base,
+                       driveDirection * base * innerFactor);
+    }
+}
 
         async function steer(direction) {
             if (direction === 0) {
