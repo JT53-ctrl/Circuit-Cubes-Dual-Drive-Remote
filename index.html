@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=0.95, user-scalable=no">
+    <title>Circuit Cubes Dual Drive Remote</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&family=League+Spartan:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script src="interface.js"></script>
+    <script src="ble_nus.js"></script>
+    <script src="ble_lwp.js"></script>
+    <script>
+        // Fixed vehicle layout: A = left drive, B = right drive, C = steering.
+        // Steering is intentionally simple: C runs only while the steering button
+        // is held, with a hard maximum run time. There is no automatic return
+        // and no differential steering.
+        const STEERING_MAX_MS = 240;
+        const STEERING_CALIBRATION_MS = 20; // manual center correction pulse
+        let steeringCalibrationBusy = false;
+        let steeringDirection = 0;
+        let steeringRunTimer = null;
+        let steeringCommandId = 0;
+
+        function getValue(id) {
+            return parseInt(document.getElementById(id).value, 10);
+        }
+
+        function getInversion(id) {
+            return document.getElementById(id).checked ? -1 : 1;
+        }
+
+        async function sendMotorCmd(speed, channel) {
+            speed = Math.max(-255, Math.min(255, Math.round(speed)));
+            const cmd = (speed >= 0 ? "+" : "-") +
+                String(Math.abs(speed)).padStart(3, "0") + channel;
+
+            while (bleNusBusy === true) await delay(1);
+            await nusSendString(cmd, true);
+            await delay(4);
+        }
+
+        async function setDrive(left, right) {
+            const li = getInversion("drive_left_invert");
+            const ri = getInversion("drive_right_invert");
+            await sendMotorCmd(left * li, "a");
+            await sendMotorCmd(right * ri, "b");
+        }
+
+        async function drive(direction) {
+            const base = getValue("drive_speed");
+            await setDrive(direction * base, direction * base);
+        }
+
+        async function steer(direction) {
+            // Releasing the button simply stops C. There is deliberately no
+            // automatic return-to-center.
+            if (direction === 0) {
+                await releaseSteering();
+                return;
+            }
+
+            if (steeringDirection === direction) return;
+
+            // Invalidate any previous steering timer/command before changing
+            // direction. This prevents an old timeout from stopping a new command.
+            steeringCommandId++;
+            const commandId = steeringCommandId;
+
+            if (steeringRunTimer !== null) {
+                clearTimeout(steeringRunTimer);
+                steeringRunTimer = null;
+            }
+
+            if (steeringDirection !== 0) {
+                await sendMotorCmd(0, "c");
+            }
+
+            steeringDirection = direction;
+
+            const speed = getValue("steer_speed") * getInversion("steer_invert");
+
+            // Start C and only then start the 240 ms safety timer.
+            await sendMotorCmd(direction * speed, "c");
+
+            steeringRunTimer = setTimeout(async () => {
+                if (commandId !== steeringCommandId || steeringDirection !== direction) return;
+
+                steeringRunTimer = null;
+                steeringDirection = 0;
+                await sendMotorCmd(0, "c");
+            }, STEERING_MAX_MS);
+        }
+
+        async function calibrateSteering(direction) {
+            // Manual visual center correction. This is independent of normal
+            // steering and remains useful because C has no position feedback.
+            if (steeringDirection !== 0 || steeringCalibrationBusy) return;
+
+            steeringCalibrationBusy = true;
+            try {
+                const speed = getValue("steer_speed") * getInversion("steer_invert");
+
+                await sendMotorCmd(0, "c");
+                await sendMotorCmd(direction * speed, "c");
+                await delay(STEERING_CALIBRATION_MS);
+                await sendMotorCmd(0, "c");
+            } finally {
+                steeringCalibrationBusy = false;
+            }
+        }
+
+        async function releaseSteering() {
+            // Invalidate the safety timer and stop C immediately.
+            steeringCommandId++;
+
+            if (steeringRunTimer !== null) {
+                clearTimeout(steeringRunTimer);
+                steeringRunTimer = null;
+            }
+
+            steeringDirection = 0;
+            await sendMotorCmd(0, "c");
+        }
+
+        handlers["onleftpluspress"] = () => steer(1);
+        handlers["onleftminuspress"] = () => steer(-1);
+        handlers["onleftrelease"] = () => steer(0);
+
+        handlers["onrightpluspress"] = () => drive(1);
+        handlers["onrightminuspress"] = () => drive(-1);
+        handlers["onrightrelease"] = () => drive(0);
+    </script>
+</head>
+
+<body onload="onLoad()">
+    <div class="app">
+        <div class="title-container">
+            <span id="cc">CIRCUIT</span><span id="cb">CUBES</span><span id="wr">DUAL DRIVE</span>
+        </div>
+
+        <div class="controls">
+            <div class="control-btns">
+                <div>
+                    <button id="left"
+                        ontouchstart="steer(1)" ontouchend="steer(0)"
+                        onmousedown="steer(1, false)" onmouseup="steer(0, false)">&uarr;</button>
+                </div>
+                <div>
+                    <button id="right"
+                        ontouchstart="steer(-1)" ontouchend="steer(0)"
+                        onmousedown="steer(-1, false)" onmouseup="steer(0, false)">&darr;</button>
+                </div>
+            </div>
+
+            <div class="control-btns" style="flex-direction: column;">
+                <div>
+                    <button id="accelerate"
+                        ontouchstart="drive(1)" ontouchend="drive(0)"
+                        onmousedown="drive(1, false)" onmouseup="drive(0, false)">&uarr;</button>
+                </div>
+                <div>
+                    <button id="reverse"
+                        ontouchstart="drive(-1)" ontouchend="drive(0)"
+                        onmousedown="drive(-1, false)" onmouseup="drive(0, false)">&darr;</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="actions">
+            <div><button id="clientConnectButton" onclick="connectionToggle()">Connect</button></div>
+            <div><button id="remoteConnectButton" onclick="remoteConnectionToggle()">Connect</button></div>
+            <div><button id="settingsButton" onclick="toggleSettings()">Settings</button></div>
+        </div>
+
+        <div id="settings">
+            Settings are saved in cookies when changed.
+
+            <br><br>
+            Drive motors:
+            <div class="group">
+                <div class="set">
+                    Speed:
+                    <input type="text" id="drive_speed" value="255" disabled>
+                    <button onclick="inc('drive_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('drive_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <strong>A</strong> = left drive
+                    <label><input id="drive_left_invert" type="checkbox"> Reverse</label>
+                </div>
+                <div class="set">
+                    <strong>B</strong> = right drive
+                    <label><input id="drive_right_invert" type="checkbox"> Reverse</label>
+                </div>
+            </div>
+
+            Steering:
+            <div class="group">
+                <div class="set"><strong>C</strong> = steering motor</div>
+                <div class="set">
+                    Speed:
+                    <input type="text" id="steer_speed" value="125" disabled>
+                    <button onclick="inc('steer_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('steer_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <label><input id="steer_invert" type="checkbox"> Reverse</label>
+                </div>
+                <div class="set"><strong>Maximum travel: 240 ms</strong></div>
+                <div class="set">
+                    Center correction:
+                    <button class="speed-btn" onclick="calibrateSteering(-1)">C ◀</button>
+                    <button class="speed-btn" onclick="calibrateSteering(1)">C ▶</button>
+                    <span>20 ms</span>
+                </div>
+            </div>
+
+            Steering return:
+            <div class="group">
+                <div class="set">
+                    C runs only while the steering button is held.
+                    Releasing the button stops C immediately; there is no automatic return.
+                </div>
+                <button class="set console-btn" onclick="toggleTerminal()">Console</button>
+            </div>
+
+            <textarea id="terminal" rows="10" cols="50" readonly></textarea>
+        </div>
+
+        <div class="about">
+            v1.0.0-dual-drive |
+            <a href="https://github.com/repkovsky/CircuitCubesRemote">Original project</a>
+        </div>
+    </div>
+
+    <video loop id="sleep_lock" style="width:1px;">
+        <!-- The original project uses a tiny video to help prevent the browser
+             from suspending the page while Bluetooth communication is active. -->
+        <source type="video/mp4" src="data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAvFtZGF0">
+    </video>
+</body>
+</html>
