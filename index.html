@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=0.95, user-scalable=no">
+    <title>Circuit Cubes Dual Drive Remote</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@100..900&family=League+Spartan:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+    <script src="interface.js"></script>
+    <script src="ble_nus.js"></script>
+    <script src="ble_lwp.js"></script>
+    <script>
+        // Fixed vehicle layout: A/B drive together, C steering.
+        // Steering follows the timing strategy of the original Repkovsky project:
+        // stop on release, then counter-steer for a duration related to the
+        // measured button press. A small minimum compensates for BLE/motor latency.
+        const STEERING_MAX_MS = 240;
+        const STEERING_RETURN_MIN_MS = 25;
+        const STEERING_RETURN_MAX_MS = 90;
+        let steeringDirection = 0;
+        let steeringStartedAt = 0;
+        let steeringRunTimer = null;
+        let steeringEventQueue = Promise.resolve();
+        let motorWriteQueue = Promise.resolve();
+        let driveEventQueue = Promise.resolve();
+
+        function getValue(id) {
+            return parseInt(document.getElementById(id).value, 10);
+        }
+        function getInversion(id) {
+            return document.getElementById(id).checked ? -1 : 1;
+        }
+
+        // All NUS writes are serialized. Each command is awaited until the BLE
+        // write has completed; no artificial delay is inserted between commands.
+        function sendMotorCmd(speed, channel) {
+            const normalized = Math.max(-255, Math.min(255, Math.round(speed)));
+            const cmd = (normalized >= 0 ? '+' : '-') +
+                String(Math.abs(normalized)).padStart(3, '0') + channel;
+            motorWriteQueue = motorWriteQueue.catch(error => {
+                terminal_writeln('Previous motor write failed: ' + String(error));
+            }).then(() => nusSendString(cmd, false));
+            return motorWriteQueue;
+        }
+
+        async function setDrive(direction) {
+            const base = getValue('drive_speed');
+            const left = direction * base * getInversion('drive_left_invert');
+            const right = direction * base * getInversion('drive_right_invert');
+            await sendMotorCmd(left, 'a');
+            await sendMotorCmd(right, 'b');
+        }
+        function drive(direction) {
+            driveEventQueue = driveEventQueue.catch(error => {
+                terminal_writeln('Drive command error: ' + String(error));
+            }).then(() => setDrive(direction));
+            return driveEventQueue;
+        }
+
+        function queueSteeringEvent(task) {
+            steeringEventQueue = steeringEventQueue.catch(error => {
+                terminal_writeln('Previous steering event failed: ' + String(error));
+            }).then(task).catch(error => {
+                terminal_writeln('Steering command error: ' + String(error));
+            });
+            return steeringEventQueue;
+        }
+
+        function steer(direction) {
+            const eventTime = performance.now();
+
+            if (direction !== 0) {
+                const previousDirection = steeringDirection;
+                steeringDirection = direction;
+                steeringStartedAt = eventTime;
+                if (steeringRunTimer !== null) clearTimeout(steeringRunTimer);
+
+                // Preserve the press even if release arrives before the BLE write
+                // completes. The following release event remains ordered behind it.
+                queueSteeringEvent(async () => {
+                    if (previousDirection !== 0) await sendMotorCmd(0, 'c');
+                    const speed = direction * getValue('steer_speed') * getInversion('steer_invert');
+                    await sendMotorCmd(speed, 'c');
+                });
+
+                steeringRunTimer = setTimeout(() => {
+                    if (steeringDirection === direction) steer(0);
+                }, STEERING_MAX_MS);
+                return;
+            }
+
+            if (steeringDirection === 0) return;
+            const previousDirection = steeringDirection;
+            const elapsed = Math.max(0, eventTime - steeringStartedAt);
+            steeringDirection = 0;
+            if (steeringRunTimer !== null) {
+                clearTimeout(steeringRunTimer);
+                steeringRunTimer = null;
+            }
+
+            // Like the original project, return duration is capped at 90 ms and
+            // normally follows the press duration. A 25 ms floor avoids a return
+            // pulse so short that BLE/motor startup consumes almost all of it.
+            const returnMs = Math.max(STEERING_RETURN_MIN_MS,
+                Math.min(STEERING_RETURN_MAX_MS, elapsed));
+            const reverseSpeed = -previousDirection * getValue('steer_speed') * getInversion('steer_invert');
+            terminal_writeln('Steering press: ' + Math.round(elapsed) + ' ms; return: ' + returnMs + ' ms');
+
+            return queueSteeringEvent(async () => {
+                await sendMotorCmd(0, 'c');
+                await sendMotorCmd(reverseSpeed, 'c');
+                await delay(returnMs);
+                await sendMotorCmd(0, 'c');
+            });
+        }
+
+        function calibrateSteering(direction) {
+            const speed = direction * getValue('steer_speed') * getInversion('steer_invert');
+            return queueSteeringEvent(async () => {
+                await sendMotorCmd(speed, 'c');
+                await delay(STEERING_RETURN_MIN_MS);
+                await sendMotorCmd(0, 'c');
+            });
+        }
+
+        // Pointer events avoid duplicate touch + synthetic mouse commands.
+        function bindHoldButton(id, onPress, onRelease) {
+            const button = document.getElementById(id);
+            if (!button) return;
+            let activePointer = null;
+            button.addEventListener('pointerdown', event => {
+                event.preventDefault();
+                if (activePointer !== null) return;
+                activePointer = event.pointerId;
+                try { button.setPointerCapture(event.pointerId); } catch (_) {}
+                onPress();
+            });
+            const release = event => {
+                if (activePointer === null || (event && event.pointerId !== undefined && event.pointerId !== activePointer)) return;
+                activePointer = null;
+                onRelease();
+            };
+            button.addEventListener('pointerup', release);
+            button.addEventListener('pointercancel', release);
+            button.addEventListener('lostpointercapture', release);
+            button.addEventListener('contextmenu', event => event.preventDefault());
+        }
+        document.addEventListener('DOMContentLoaded', () => {
+            bindHoldButton('left', () => steer(1), () => steer(0));
+            bindHoldButton('right', () => steer(-1), () => steer(0));
+            bindHoldButton('accelerate', () => drive(1), () => drive(0));
+            bindHoldButton('reverse', () => drive(-1), () => drive(0));
+        });
+
+        handlers['onleftpluspress'] = () => steer(1);
+        handlers['onleftminuspress'] = () => steer(-1);
+        handlers['onleftrelease'] = () => steer(0);
+        handlers['onleftstoppress'] = () => steer(0);
+        handlers['onrightpluspress'] = () => drive(1);
+        handlers['onrightminuspress'] = () => drive(-1);
+        handlers['onrightrelease'] = () => drive(0);
+        handlers['onrightstoppress'] = () => drive(0);
+    </script>
+</head>
+
+<body onload="onLoad()">
+    <div class="app">
+        <div class="title-container">
+            <span id="cc">CIRCUIT</span><span id="cb">CUBES</span><span id="wr">DUAL DRIVE</span>
+        </div>
+
+        <div class="controls">
+            <div class="control-btns">
+                <div>
+                    <button id="left"
+>&uarr;</button>
+                </div>
+                <div>
+                    <button id="right"
+>&darr;</button>
+                </div>
+            </div>
+
+            <div class="control-btns" style="flex-direction: column;">
+                <div>
+                    <button id="accelerate"
+>&uarr;</button>
+                </div>
+                <div>
+                    <button id="reverse"
+>&darr;</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="actions">
+            <div><button id="clientConnectButton" onclick="connectionToggle()">Connect</button></div>
+            <div><button id="remoteConnectButton" onclick="remoteConnectionToggle()">Connect</button></div>
+            <div><button id="settingsButton" onclick="toggleSettings()">Settings</button></div>
+        </div>
+
+        <div id="settings">
+            Settings are saved in cookies when changed.
+
+            <br><br>
+            Drive motors:
+            <div class="group">
+                <div class="set">
+                    Speed:
+                    <input type="text" id="drive_speed" value="255" disabled>
+                    <button onclick="inc('drive_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('drive_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <strong>A</strong> = left drive
+                    <label><input id="drive_left_invert" type="checkbox"> Reverse</label>
+                </div>
+                <div class="set">
+                    <strong>B</strong> = right drive
+                    <label><input id="drive_right_invert" type="checkbox"> Reverse</label>
+                </div>
+            </div>
+
+            Steering:
+            <div class="group">
+                <div class="set"><strong>C</strong> = steering motor</div>
+                <div class="set">
+                    Speed:
+                    <input type="text" id="steer_speed" value="125" disabled>
+                    <button onclick="inc('steer_speed')" class="speed-btn">+</button>
+                    <button onclick="dec('steer_speed')" class="speed-btn">-</button>
+                </div>
+                <div class="set">
+                    <label><input id="steer_invert" type="checkbox"> Reverse</label>
+                </div>
+                <div class="set"><strong>Maximum steering pulse: 240 ms</strong></div>
+                <div class="set">
+                    Automatic return pulse: <strong>10 ms</strong>
+                </div>
+            </div>
+
+            Steering return:
+            <div class="group">
+                <div class="set">
+                    After release, C counter-steers for up to 90 ms (normally matching the press duration).
+                    Very short presses receive a 25 ms minimum to compensate for BLE/motor latency.
+                </div>
+                <button class="set console-btn" onclick="toggleTerminal()">Console</button>
+            </div>
+
+            <textarea id="terminal" rows="10" cols="50" readonly></textarea>
+        </div>
+
+        <div class="about">
+            v1.2.0-dual-drive |
+            <a href="https://github.com/repkovsky/CircuitCubesRemote">Original project</a>
+        </div>
+    </div>
+
+</body>
+</html>
